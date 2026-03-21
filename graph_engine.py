@@ -1,0 +1,131 @@
+import networkx as nx
+import pandas as pd
+import time
+
+def build_transaction_graph(df):
+    """
+    Constructs a highly optimized MultiDiGraph from transaction data.
+    """
+    print("Starting optimized graph construction...")
+    start_time = time.time()
+    
+    # 1. Sort by step first to ensure chronological order for time-dependent patterns
+    df = df.sort_values('step').reset_index(drop=True)
+    
+    # 2. Use MultiDiGraph to preserve all transactions between the same accounts
+    G = nx.MultiDiGraph()
+    
+    # 3. Fast batch edge addition with comprehensive edge attributes
+    print("Batch adding edges...")
+    edges = list(zip(
+        df['nameOrig'],
+        df['nameDest'],
+        [{'amount': a, 'step': s, 'tx_type': t, 'is_fraud': f, 'balance_before': ob, 'balance_after': nb} 
+         for a, s, t, f, ob, nb in zip(
+             df['amount'], df['step'], df['type'], df['isFraud'], df['oldbalanceOrg'], df['newbalanceOrig']
+         )]
+    ))
+    G.add_edges_from(edges)
+    
+    # 4. Compute node stats incrementally without loops by using pandas groupby
+    print("Computing node attributes efficiently...")
+    
+    # Stats as a sender
+    sender_stats = df.groupby('nameOrig').agg(
+        total_sent=('amount', 'sum'),
+        tx_count_out=('amount', 'count'),
+        first_seen_out=('step', 'min'),
+        last_seen_out=('step', 'max')
+    )
+    
+    # Stats as a receiver
+    receiver_stats = df.groupby('nameDest').agg(
+        total_received=('amount', 'sum'),
+        tx_count_in=('amount', 'count'),
+        first_seen_in=('step', 'min'),
+        last_seen_in=('step', 'max')
+    )
+    
+    # Node types
+    types_out = df.groupby('nameOrig')['type'].apply(set).to_dict()
+    types_in = df.groupby('nameDest')['type'].apply(set).to_dict()
+    
+    # Fraud tracking (if an account was involved in fraud on either side)
+    fraud_senders = set(df[df['isFraud'] == 1]['nameOrig'])
+    fraud_receivers = set(df[df['isFraud'] == 1]['nameDest'])
+    fraud_nodes = fraud_senders.union(fraud_receivers)
+    
+    # Consolidate attributes for all distinct nodes
+    all_nodes = set(df['nameOrig']).union(set(df['nameDest']))
+    
+    s_dict = sender_stats.to_dict('index')
+    r_dict = receiver_stats.to_dict('index')
+    
+    node_attrs = {}
+    for node in all_nodes:
+        s = s_dict.get(node, {'total_sent': 0, 'tx_count_out': 0, 'first_seen_out': float('inf'), 'last_seen_out': -1})
+        r = r_dict.get(node, {'total_received': 0, 'tx_count_in': 0, 'first_seen_in': float('inf'), 'last_seen_in': -1})
+        
+        first_seen = min(s['first_seen_out'], r['first_seen_in'])
+        last_seen = max(s['last_seen_out'], r['last_seen_in'])
+        
+        # Combine transaction types and convert to list out of set for safe PyVis serialization
+        tx_types = list(types_out.get(node, set()).union(types_in.get(node, set())))
+        
+        node_attrs[node] = {
+            'total_sent': s['total_sent'],
+            'total_received': r['total_received'],
+            'tx_count': s['tx_count_out'] + r['tx_count_in'],
+            'first_seen': first_seen,
+            'last_seen': last_seen,
+            'tx_types': tx_types,
+            'is_fraud': node in fraud_nodes
+        }
+        
+    nx.set_node_attributes(G, node_attrs)
+    
+    print(f"Graph constructed in {time.time() - start_time:.2f} seconds.")
+    return G
+
+def validate_graph(G, df):
+    """
+    Validates graph health to avoid quiet failures downstream.
+    """
+    print("\n--- Validating Graph ---")
+    print(f"Nodes:          {G.number_of_nodes():,}")
+    print(f"Edges:          {G.number_of_edges():,}")
+    print(f"Expected edges: {len(df):,}")
+
+    # Check 1: Edge integrity
+    assert G.number_of_edges() == len(df), "FAIL: edges lost during construction!"
+
+    # Check 2: Remove self-loops (using keys=True because it's a MultiDiGraph)
+    self_loops = list(nx.selfloop_edges(G, keys=True))
+    print(f"Self-loops:     {len(self_loops)} (Removed)")
+    G.remove_edges_from(self_loops)
+
+    # Check 3: Graph connectivity mapping
+    components = nx.number_weakly_connected_components(G)
+    print(f"Components:     {components:,}")
+
+    # Check 4: Fraud node presence test
+    fraud_df = df[df['isFraud'] == 1]
+    if not fraud_df.empty:
+        sample_fraud = fraud_df['nameOrig'].iloc[0]
+        assert sample_fraud in G.nodes, "FAIL: sample fraud node is missing!"
+
+    print("✅ Graph validation passed\n")
+    return G
+
+if __name__ == "__main__":
+    try:
+        df = pd.read_parquet('sampled_transactions.parquet')
+        print(f"Loaded {len(df)} transactions.")
+        
+        # Separate graph architecture logic cleanly: build -> validate
+        G = build_transaction_graph(df)
+        G = validate_graph(G, df)
+        
+        print("Ready for pattern detection or ML scoring!")
+    except FileNotFoundError:
+        print("Error: 'sampled_transactions.parquet' not found in current directory. Please run the data prep first.")
