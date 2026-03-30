@@ -1,6 +1,9 @@
 import networkx as nx
 import pandas as pd
 import time
+import os
+import pickle
+from data_ingestion import ingest_data_from_parquet
 
 def build_transaction_graph(df):
     """
@@ -117,13 +120,106 @@ def validate_graph(G, df):
     print("✅ Graph validation passed\n")
     return G
 
+# ==========================================
+# GRAPH CACHING AND INCREMENTAL UPDATES
+# ==========================================
+
+def save_graph(G, path="cache/graph.pkl"):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(G, f)
+    print(f"Graph saved — {G.number_of_nodes()} nodes, "
+          f"{G.number_of_edges()} edges")
+
+def load_graph(path="cache/graph.pkl"):
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    return None
+
+def get_graph(df, force_rebuild=False):
+    GRAPH_CACHE = "cache/graph.pkl"
+    
+    # Load from cache if it exists
+    if os.path.exists(GRAPH_CACHE) and not force_rebuild:
+        print("Loading cached graph...")
+        G = load_graph(GRAPH_CACHE)
+        if G is not None:
+            print(f"Loaded: {G.number_of_nodes():,} nodes, "
+                  f"{G.number_of_edges():,} edges")
+            return G
+    
+    # Build fresh
+    print("Building graph from scratch...")
+    G = build_transaction_graph(df)
+    save_graph(G, GRAPH_CACHE)
+    return G
+
+def update_graph_with_new_data(G, new_df):
+    """
+    Add new transactions to existing graph.
+    Do NOT rebuild — just extend.
+    """
+    new_df = new_df.sort_values('step')
+    
+    for _, row in new_df.iterrows():
+        src = row['nameOrig']
+        dst = row['nameDest']
+        
+        # Add nodes if they don't exist yet
+        if src not in G:
+            G.add_node(src, total_sent=0, total_received=0,
+                       tx_count=0, first_seen=row['step'],
+                       last_seen=row['step'],
+                       tx_types=[], is_fraud=False)
+        if dst not in G:
+            G.add_node(dst, total_sent=0, total_received=0,
+                       tx_count=0, first_seen=row['step'],
+                       last_seen=row['step'],
+                       tx_types=[], is_fraud=False)
+        
+        # Add new edge
+        G.add_edge(src, dst,
+                   amount=row['amount'],
+                   step=row['step'],
+                   tx_type=row['type'],
+                   is_fraud=row['isFraud'],
+                   balance_before=row.get('oldbalanceOrg', 0),
+                   balance_after=row.get('newbalanceOrig', 0))
+        
+        # Update node stats incrementally
+        G.nodes[src]['total_sent']  += row['amount']
+        G.nodes[src]['tx_count']    += 1
+        G.nodes[src]['last_seen']    = row['step']
+        
+        # Ensure tx_types is a list and append if not empty
+        if 'tx_types' not in G.nodes[src]: G.nodes[src]['tx_types'] = []
+        if row['type'] not in G.nodes[src]['tx_types']: G.nodes[src]['tx_types'].append(row['type'])
+        
+        G.nodes[dst]['total_received'] += row['amount']
+        G.nodes[dst]['tx_count'] += 1
+        G.nodes[dst]['last_seen'] = max(row['step'], G.nodes[dst].get('last_seen', 0))
+        
+        if 'tx_types' not in G.nodes[dst]: G.nodes[dst]['tx_types'] = []
+        if row['type'] not in G.nodes[dst]['tx_types']: G.nodes[dst]['tx_types'].append(row['type'])
+        
+        if row['isFraud']:
+            G.nodes[src]['is_fraud'] = True
+            G.nodes[dst]['is_fraud'] = True
+            
+    # Save updated graph
+    save_graph(G, "cache/graph.pkl")
+    print(f"Graph updated: {G.number_of_nodes():,} nodes, "
+          f"{G.number_of_edges():,} edges")
+    return G
+
 if __name__ == "__main__":
     try:
-        df = pd.read_parquet('sampled_transactions.parquet')
+        df = ingest_data_from_parquet('sampled_transactions.parquet')
         print(f"Loaded {len(df)} transactions.")
         
         # Separate graph architecture logic cleanly: build -> validate
-        G = build_transaction_graph(df)
+        G = get_graph(df)
         G = validate_graph(G, df)
         
         print("Ready for pattern detection or ML scoring!")

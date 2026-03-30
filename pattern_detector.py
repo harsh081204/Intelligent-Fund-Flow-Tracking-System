@@ -3,11 +3,14 @@ import pandas as pd
 import numpy as np
 from collections import defaultdict
 import time
+import os
+import joblib
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
+from data_ingestion import ingest_data_from_parquet
 
 # Import our optimized graph builder
-from graph_engine import build_transaction_graph, validate_graph
+from graph_engine import build_transaction_graph, validate_graph, get_graph, update_graph_with_new_data
 
 # ==========================================
 # LAYER 1: ALGORITHMIC PATTERN DETECTORS
@@ -253,10 +256,30 @@ def extract_node_features(G):
         
     return pd.DataFrame(features).T.fillna(0)
 
-def train_isolation_forest(features_df, contamination=0.05):
+def get_model(features_df, force_retrain=False, contamination=0.05):
     """
-    Train Isolation Forest model.
+    Train or load Isolation Forest model.
     """
+    MODEL_PATH = "models/isolation_forest.pkl"
+    SCALER_PATH = "models/scaler.pkl"
+    
+    if os.path.exists(MODEL_PATH) and not force_retrain:
+        print("Loading saved model...")
+        iso = joblib.load(MODEL_PATH)
+        scaler = joblib.load(SCALER_PATH)
+        
+        X = scaler.transform(features_df.reindex(columns=scaler.feature_names_in_, fill_value=0))
+        raw_scores = iso.decision_function(X)
+        min_s, max_s = raw_scores.min(), raw_scores.max()
+        
+        if max_s == min_s:
+            ml_scores = np.zeros_like(raw_scores)
+        else:
+            ml_scores = (1 - (raw_scores - min_s) / (max_s - min_s + 1e-9)) * 100
+            
+        return dict(zip(features_df.index, ml_scores)), scaler, iso
+
+    print("Training model...")
     scaler = StandardScaler()
     X = scaler.fit_transform(features_df)
     
@@ -269,6 +292,11 @@ def train_isolation_forest(features_df, contamination=0.05):
     )
     iso.fit(X)
     
+    os.makedirs("models", exist_ok=True)
+    joblib.dump(iso, MODEL_PATH)
+    joblib.dump(scaler, SCALER_PATH)
+    print("Model saved.")
+    
     raw_scores = iso.decision_function(X)
     min_s, max_s = raw_scores.min(), raw_scores.max()
     
@@ -276,7 +304,7 @@ def train_isolation_forest(features_df, contamination=0.05):
         ml_scores = np.zeros_like(raw_scores)
     else:
         # Normalize to 0-100 (invert so more negative/anomalous == higher score)
-        ml_scores = (1 - (raw_scores - min_s) / (max_s - min_s)) * 100
+        ml_scores = (1 - (raw_scores - min_s) / (max_s - min_s + 1e-9)) * 100
         
     return dict(zip(features_df.index, ml_scores)), scaler, iso
 
@@ -366,17 +394,92 @@ def compute_ensemble_risk_scores(G, ml_scores, all_patterns):
     return node_profiles
 
 # ==========================================
+# INCREMENTAL DETECTIONS FOR NEW DATA
+# ==========================================
+
+def handle_new_data(new_df, existing_features_df, iso_model, scaler, retrain_threshold=0.10):
+    new_G = build_transaction_graph(new_df)
+    new_features = extract_node_features(new_G)
+    
+    new_ratio = len(new_features) / len(existing_features_df) if len(existing_features_df) > 0 else 1.0
+    
+    if new_ratio > retrain_threshold:
+        print(f"New data is {new_ratio:.0%} of original — retraining")
+        combined_features = pd.concat([existing_features_df, new_features]).drop_duplicates()
+        ml_scores, scaler, iso_model = get_model(combined_features, force_retrain=True)
+    else:
+        print(f"Small batch ({new_ratio:.0%}) — scoring without retraining")
+        X_new = scaler.transform(new_features.reindex(columns=scaler.feature_names_in_, fill_value=0))
+        raw_scores = iso_model.decision_function(X_new)
+        min_s, max_s = raw_scores.min(), raw_scores.max()
+        if max_s == min_s:
+            scores_array = np.zeros_like(raw_scores)
+        else:
+            scores_array = (1 - (raw_scores - min_s) / (max_s - min_s + 1e-9)) * 100
+        ml_scores = dict(zip(new_features.index, scores_array))
+        
+    return ml_scores, iso_model, scaler
+
+def run_incremental_detection(G, new_df, existing_alerts, iso_model, scaler):
+    """
+    Run detection only on nodes touched by new transactions.
+    """
+    affected_nodes = set(new_df['nameOrig'].tolist() + new_df['nameDest'].tolist())
+    
+    extended_nodes = set(affected_nodes)
+    for node in affected_nodes:
+        if node in G:
+            extended_nodes.update(G.predecessors(node))
+            extended_nodes.update(G.successors(node))
+            for neighbor in G.successors(node):
+                extended_nodes.update(G.successors(neighbor))
+                
+    subG = G.subgraph(extended_nodes).copy()
+    
+    new_patterns = []
+    new_patterns += detect_round_trips(subG)
+    new_patterns += detect_layering(subG)
+    new_patterns += detect_structuring(new_df[new_df['nameOrig'].isin(affected_nodes)])
+    new_patterns += detect_dormant_activation(new_df, subG)
+    
+    new_features = extract_node_features(subG)
+    X_new = scaler.transform(new_features.reindex(columns=scaler.feature_names_in_, fill_value=0))
+    raw_scores = iso_model.decision_function(X_new)
+    min_s, max_s = raw_scores.min(), raw_scores.max()
+    
+    if max_s == min_s:
+        raw_scores_norm = np.zeros_like(raw_scores)
+    else:
+        raw_scores_norm = (1 - (raw_scores - min_s) / (max_s - min_s + 1e-9)) * 100
+        
+    ml_scores = dict(zip(new_features.index, raw_scores_norm))
+    
+    new_alerts = compute_ensemble_risk_scores(subG, ml_scores, new_patterns)
+    high_critical_alerts = [alert for alert in new_alerts.values() if alert['severity'] in ('HIGH', 'CRITICAL')]
+    
+    # Merge carefully
+    all_alerts = existing_alerts.copy() if hasattr(existing_alerts, "copy") else existing_alerts
+    if isinstance(all_alerts, list):
+        all_alerts.extend(high_critical_alerts)
+    else: # If standard dict return
+        all_alerts.update({k: v for k, v in new_alerts.items() if v['severity'] in ('HIGH', 'CRITICAL')})
+        
+    return all_alerts, new_patterns
+
+# ==========================================
 # MAIN EXECUTION AND EVALUATION
 # ==========================================
 
 if __name__ == "__main__":
     print("1. Loading dataset...")
-    df = pd.read_parquet('sampled_transactions.parquet')
+    df = ingest_data_from_parquet('sampled_transactions.parquet')
     
-    print("2. Building graph using Graph Engine...")
-    G = build_transaction_graph(df)
+    print("2. Building or loading graph using Graph Engine...")
+    G = get_graph(df)
     
     print("3. Executing Layer 1: Algorithmic Detectors...")
+    # NOTE: In a true production loop these alerts would be cached too,
+    # but we compute them fresh here for full-dataset logic
     t0 = time.time()
     round_trips = detect_round_trips(G)
     layering = detect_layering(G)
@@ -388,8 +491,9 @@ if __name__ == "__main__":
     
     print("4. Executing Layer 2: Feature Extraction & Isolation Forest...")
     t0 = time.time()
+    # Cache features if needed, here we re-extract or load from model step
     features_df = extract_node_features(G)
-    ml_scores, scaler, iso_model = train_isolation_forest(features_df)
+    ml_scores, scaler, iso_model = get_model(features_df)
     print(f"Layer 2 finished in {time.time() - t0:.2f}s")
     
     print("5. Computing Ensemble Scores...")

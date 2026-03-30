@@ -45,8 +45,9 @@
 
 
 import pandas as pd
+from data_ingestion import ingest_data_from_parquet
 
 # This will load in a fraction of a second!
-df = pd.read_parquet('sampled_transactions.parquet')
+df = ingest_data_from_parquet('sampled_transactions.parquet')
 
 print(f"Loaded {len(df)} rows ready for graph construction.")
